@@ -1,11 +1,10 @@
-
 import re
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from shapely.geometry import Polygon, MultiPolygon, MultiPoint
+from shapely.geometry import Polygon, MultiPolygon
 
 
 # ============================================================================
@@ -20,10 +19,14 @@ TEST_CSV = (
 )
 
 OUT_DIR = Path("dataset")
-
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 RANDOM_STATE = 42
+
+REQUIRED_EXTRA_COLS = [
+    "SimulationCentroidXYZ",
+    "SimulationReferenceImage",
+]
 
 
 # ============================================================================
@@ -41,20 +44,27 @@ print("Test original:", df_test.shape)
 # 3. FILTER CORROSION
 # ============================================================================
 
-df_training = df_training[
-    df_training["classe_nome"] == "corrosion"
-].copy()
+if "classe_nome" in df_training.columns:
+    df_training = df_training[
+        df_training["classe_nome"].astype(str).str.strip().str.lower() == "corrosion"
+    ].copy()
 
-df_test = df_test[
-    df_test["classe_nome"] == "corrosion"
-].copy()
+if "classe_nome" in df_test.columns:
+    df_test = df_test[
+        df_test["classe_nome"].astype(str).str.strip().str.lower() == "corrosion"
+    ].copy()
 
 print("Training corrosion:", df_training.shape)
 print("Test corrosion:", df_test.shape)
 
+if df_training.empty:
+    print("Aviso: df_training ficou vazio apos filtrar classe_nome == 'corrosion'.")
+if df_test.empty:
+    print("Aviso: df_test ficou vazio apos filtrar classe_nome == 'corrosion'.")
+
 
 # ============================================================================
-# 4. DROP UNNECESSARY COLUMNS
+# 4. DROP UNNECESSARY COLUMNS & ENSURE REQUESTED COLUMNS
 # ============================================================================
 
 list_drop_features = [
@@ -79,19 +89,18 @@ list_drop_features = [
     "SimulationReferenceDetID", "classe_nome"
 ]
 
-# Keep dano_id temporarily for identification/grouping.
-# Remove it only from the model features.
-
 df_training = df_training.drop(columns=list_drop_features, errors="ignore")
 df_test = df_test.drop(columns=list_drop_features, errors="ignore")
 
+for col_req in REQUIRED_EXTRA_COLS:
+    for split_name, _df in [("train", df_training), ("test", df_test)]:
+        if col_req not in _df.columns:
+            print(f"Aviso ({split_name}): coluna '{col_req}' nao existe; criada com NaN.")
+            _df[col_req] = np.nan
 
-# Parse dates before any temporal operation.
 for _df in (df_training, df_test):
     if "data" not in _df.columns:
         raise ValueError("A coluna 'data' é necessária para criar lag features.")
-    if "SimulationReferenceImage" not in _df.columns:
-        raise ValueError("A coluna 'SimulationReferenceImage' é necessária para o agrupamento temporal.")
     _df["data"] = pd.to_datetime(_df["data"], errors="coerce")
 
 df_training = df_training.sort_values(
@@ -107,7 +116,6 @@ df_test = df_test.sort_values(
 # ============================================================================
 
 def extract_shape_features(polygon_string):
-
     empty_result = {
         "ShapeArea": np.nan,
         "ShapePerimeter": np.nan,
@@ -119,10 +127,9 @@ def extract_shape_features(polygon_string):
         "ShapeHeight": np.nan
     }
 
-    if not isinstance(polygon_string, str):
+    if not isinstance(polygon_string, str) or not polygon_string.strip():
         return empty_result
 
-    # Extract 2D coordinates from the polygon string
     points = re.findall(
         r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*"
         r"(-?\d+(?:\.\d+)?)\s*\]",
@@ -134,7 +141,6 @@ def extract_shape_features(polygon_string):
 
     coords = np.array(points, dtype=float)
 
-    # Remove only consecutive duplicate points, preserving contour order.
     if len(coords) > 1:
         keep = np.r_[True, np.any(np.diff(coords, axis=0) != 0, axis=1)]
         coords = coords[keep]
@@ -145,26 +151,17 @@ def extract_shape_features(polygon_string):
         return empty_result
 
     try:
-
         polygon = Polygon(coords)
 
-        # Repair invalid geometry
         if not polygon.is_valid:
             polygon = polygon.buffer(0)
 
         if polygon.is_empty or polygon.area <= 0:
             return empty_result
 
-        # If geometry has multiple components, retain all components
-        if isinstance(polygon, MultiPolygon):
-            geometry = polygon
-        else:
-            geometry = polygon
-
-        # Convex hull
+        geometry = polygon
         hull = geometry.convex_hull
 
-        # Geometry measurements
         area = geometry.area
         perimeter = geometry.length
 
@@ -178,7 +175,6 @@ def extract_shape_features(polygon_string):
             if hull.area > 0 else np.nan
         )
 
-        # Collect exterior coordinates
         if isinstance(geometry, MultiPolygon):
             all_coords = np.vstack([
                 np.asarray(part.exterior.coords)
@@ -189,19 +185,12 @@ def extract_shape_features(polygon_string):
                 geometry.exterior.coords
             )
 
-        # PCA for principal orientation
         centered = all_coords - all_coords.mean(axis=0)
-
         covariance = np.cov(centered.T)
-
-        eigenvalues, eigenvectors = np.linalg.eigh(
-            covariance
-        )
-
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
         eigenvalues = np.maximum(eigenvalues, 1e-10)
 
         idx = np.argmax(eigenvalues)
-
         direction = eigenvectors[:, idx]
 
         orientation = np.degrees(
@@ -212,7 +201,6 @@ def extract_shape_features(polygon_string):
             eigenvalues.max() / eigenvalues.min()
         )
 
-        # Bounding box
         min_x, min_y, max_x, max_y = geometry.bounds
 
         return {
@@ -230,36 +218,61 @@ def extract_shape_features(polygon_string):
         return empty_result
 
 
-# Extract geometry from training
-if "SimulatedPolygon2D" in df_training.columns:
+shape_cols = [
+    "ShapeArea", "ShapePerimeter", "ShapeElongation",
+    "ShapeCircularity", "ShapeSolidity", "ShapeOrientationDeg",
+    "ShapeWidth", "ShapeHeight"
+]
 
-    shape_train = pd.DataFrame(
-        df_training["SimulatedPolygon2D"].apply(
-            extract_shape_features
-        ).tolist(),
-        index=df_training.index
-    )
+for _df in (df_training, df_test):
+    if "SimulatedPolygon2D" in _df.columns and not _df.empty:
+        shape_df = pd.DataFrame(
+            _df["SimulatedPolygon2D"].apply(extract_shape_features).tolist(),
+            index=_df.index
+        )
+        for col in shape_cols:
+            _df[col] = shape_df[col]
+    else:
+        for col in shape_cols:
+            _df[col] = np.nan
 
-    df_training = pd.concat(
-        [df_training, shape_train],
-        axis=1
-    )
+
+# ============================================================================
+# 6. PARSE SimulationCentroidXYZ (X, Y, Z NUMERICOS)
+# ============================================================================
+
+def parse_xyz(val):
+    empty = {"SimCentroid_X": np.nan, "SimCentroid_Y": np.nan, "SimCentroid_Z": np.nan}
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return empty
+    if isinstance(val, (list, tuple, np.ndarray)) and len(val) >= 3:
+        nums = pd.to_numeric(list(val[:3]), errors="coerce")
+        return {"SimCentroid_X": nums[0], "SimCentroid_Y": nums[1], "SimCentroid_Z": nums[2]}
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return empty
+        nums = re.findall(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", s)
+        if len(nums) >= 3:
+            return {
+                "SimCentroid_X": float(nums[0]),
+                "SimCentroid_Y": float(nums[1]),
+                "SimCentroid_Z": float(nums[2]),
+            }
+    return empty
 
 
-# Extract geometry from test, only if available
-if "SimulatedPolygon2D" in df_test.columns:
-
-    shape_test = pd.DataFrame(
-        df_test["SimulatedPolygon2D"].apply(
-            extract_shape_features
-        ).tolist(),
-        index=df_test.index
-    )
-
-    df_test = pd.concat(
-        [df_test, shape_test],
-        axis=1
-    )
+for _df in (df_training, df_test):
+    if not _df.empty:
+        xyz_df = pd.DataFrame(
+            _df["SimulationCentroidXYZ"].apply(parse_xyz).tolist(),
+            index=_df.index
+        )
+        for c in ["SimCentroid_X", "SimCentroid_Y", "SimCentroid_Z"]:
+            _df[c] = xyz_df[c]
+    else:
+        for c in ["SimCentroid_X", "SimCentroid_Y", "SimCentroid_Z"]:
+            _df[c] = np.nan
 
 
 # ============================================================================
@@ -267,67 +280,50 @@ if "SimulatedPolygon2D" in df_test.columns:
 # ============================================================================
 
 def encode_direction(df, column):
-
     if column not in df.columns:
         return df
 
-    angle = pd.to_numeric(
-        df[column],
-        errors="coerce"
-    )
-
+    angle = pd.to_numeric(df[column], errors="coerce")
     radians = np.deg2rad(angle)
 
     df[column + "_sin"] = np.sin(radians)
     df[column + "_cos"] = np.cos(radians)
-
     return df
 
 
 def encode_orientation(df, column):
-
     if column not in df.columns:
         return df
 
-    angle = pd.to_numeric(
-        df[column],
-        errors="coerce"
-    )
-
-    # Axial orientation: period of 180 degrees
+    angle = pd.to_numeric(df[column], errors="coerce")
     radians = np.deg2rad(2 * angle)
 
     df[column + "_sin2"] = np.sin(radians)
     df[column + "_cos2"] = np.cos(radians)
-
     return df
 
 
-# Environmental directions (360 degrees)
-for column in [
-    "WindDirectionDeg",
-    "WDRDirectionDeg"
-]:
-
+for column in ["WindDirectionDeg", "WDRDirectionDeg"]:
     df_training = encode_direction(df_training, column)
     df_test = encode_direction(df_test, column)
 
-
-# Initial shape orientation (180 degrees)
-df_training = encode_orientation(
-    df_training, "OriginalShapeAngleDeg"
-)
-
-df_test = encode_orientation(
-    df_test, "OriginalShapeAngleDeg"
-)
+df_training = encode_orientation(df_training, "OriginalShapeAngleDeg")
+df_test = encode_orientation(df_test, "OriginalShapeAngleDeg")
 
 
 # ============================================================================
 # 8. CREATE LAG FEATURES (TRAIN + TEST IN ONE CHRONOLOGICAL SEQUENCE)
 # ============================================================================
 
-GROUP_COL = "SimulationReferenceImage"  # metadata, used internally for grouping
+GROUP_COL = "SimulationReferenceImage"
+
+# Inclui explicitamente SimCentroid_X, SimCentroid_Y e SimCentroid_Z para gerar
+# SimCentroid_X_lag_1, SimCentroid_Y_lag_1 e SimCentroid_Z_lag_1.
+SIM_CENTROID_LAG_COLS = [
+    "SimCentroid_X",
+    "SimCentroid_Y",
+    "SimCentroid_Z",
+]
 
 LAG_SOURCE_COLUMNS = [
     "EnvironmentFactor",
@@ -340,6 +336,7 @@ LAG_SOURCE_COLUMNS = [
     "ShapeCircularity", "ShapeSolidity", "ShapeOrientationDeg",
     "ShapeWidth", "ShapeHeight",
     "centroid_X", "centroid_Y", "centroid_Z",
+    *SIM_CENTROID_LAG_COLS,
 ]
 LAG_SOURCE_COLUMNS = list(dict.fromkeys(LAG_SOURCE_COLUMNS))
 LAG_STEPS = [1]
@@ -363,18 +360,19 @@ for col in _available_lag_columns:
     _all[col] = pd.to_numeric(_all[col], errors="coerce")
 
 lag_columns = []
-valid_group = _all[GROUP_COL].notna()
+valid_group = _all[GROUP_COL].notna() & (_all[GROUP_COL].astype(str).str.strip() != "")
 for col in _available_lag_columns:
     for lag_step in LAG_STEPS:
         lag_col = f"{col}_lag_{lag_step}"
         if lag_col in _all.columns:
             raise ValueError(f"A coluna de lag já existe: {lag_col}")
         _all[lag_col] = np.nan
-        _all.loc[valid_group, lag_col] = (
-            _all.loc[valid_group]
-            .groupby(GROUP_COL, sort=False)[col]
-            .shift(lag_step)
-        )
+        if valid_group.any():
+            _all.loc[valid_group, lag_col] = (
+                _all.loc[valid_group]
+                .groupby(GROUP_COL, sort=False)[col]
+                .shift(lag_step)
+            )
         lag_columns.append(lag_col)
 
 if lag_columns:
@@ -395,6 +393,7 @@ df_test = (
 
 print("Lag features created:", len(lag_columns))
 print("Lag source columns:", _available_lag_columns)
+print("SimCentroid lag columns:", [f"{c}_lag_{s}" for c in SIM_CENTROID_LAG_COLS for s in LAG_STEPS])
 print("Training dates:", df_training["data"].min(), "->", df_training["data"].max())
 print("Test dates:", df_test["data"].min(), "->", df_test["data"].max())
 
@@ -403,30 +402,14 @@ print("Test dates:", df_test["data"].min(), "->", df_test["data"].max())
 # 9. CREATE TARGET VARIABLES
 # ============================================================================
 
-# Target 1: Final growth direction (360 degrees)
-
 if "FinalGrowthAngleDeg" not in df_training.columns:
-    raise ValueError(
-        "FinalGrowthAngleDeg is missing from training data."
-    )
+    raise ValueError("FinalGrowthAngleDeg is missing from training data.")
 
-final_angle = pd.to_numeric(
-    df_training["FinalGrowthAngleDeg"],
-    errors="coerce"
-)
-
+final_angle = pd.to_numeric(df_training["FinalGrowthAngleDeg"], errors="coerce")
 final_angle_rad = np.deg2rad(final_angle)
 
-df_training["Target_Direction_Sin"] = np.sin(
-    final_angle_rad
-)
-
-df_training["Target_Direction_Cos"] = np.cos(
-    final_angle_rad
-)
-
-
-# Target 2: Shape characteristics
+df_training["Target_Direction_Sin"] = np.sin(final_angle_rad)
+df_training["Target_Direction_Cos"] = np.cos(final_angle_rad)
 
 shape_target_columns = [
     "ShapeElongation",
@@ -434,21 +417,10 @@ shape_target_columns = [
     "ShapeSolidity"
 ]
 
-# Target 3: Principal shape orientation (180 degrees)
-
 if "ShapeOrientationDeg" in df_training.columns:
-
-    orientation_rad = np.deg2rad(
-        2 * df_training["ShapeOrientationDeg"]
-    )
-
-    df_training["Target_ShapeOrientation_Sin"] = (
-        np.sin(orientation_rad)
-    )
-
-    df_training["Target_ShapeOrientation_Cos"] = (
-        np.cos(orientation_rad)
-    )
+    orientation_rad = np.deg2rad(2 * df_training["ShapeOrientationDeg"])
+    df_training["Target_ShapeOrientation_Sin"] = np.sin(orientation_rad)
+    df_training["Target_ShapeOrientation_Cos"] = np.cos(orientation_rad)
 
 
 # ============================================================================
@@ -465,29 +437,17 @@ target_columns = [
     "Target_ShapeOrientation_Cos"
 ]
 
-# Verify targets
-missing_targets = [
-    col for col in target_columns
-    if col not in df_training.columns
-]
-
+missing_targets = [col for col in target_columns if col not in df_training.columns]
 if missing_targets:
-    raise ValueError(
-        f"Missing target columns: {missing_targets}"
-    )
+    raise ValueError(f"Missing target columns: {missing_targets}")
 
-
-# Remove observations without valid targets
-df_training = df_training.dropna(
-    subset=target_columns
-).copy()
+df_training = df_training.dropna(subset=target_columns).copy()
 
 
 # ============================================================================
 # 11. DEFINE METADATA AND EXCLUDED FEATURES
 # ============================================================================
 
-# Requested fields are preserved in metadata and excluded from model inputs.
 metadata_columns = [
     "dano_id",
     "data",
@@ -504,8 +464,6 @@ metadata_test_columns = [c for c in metadata_columns if c in df_test.columns]
 metadata_train = df_training[metadata_train_columns].copy()
 metadata_test = df_test[metadata_test_columns].copy()
 
-# Current geometry defines shape targets, so only historical lag versions
-# are eligible as model inputs.
 current_geometry_columns = [
     "ShapeArea", "ShapePerimeter", "ShapeElongation",
     "ShapeCircularity", "ShapeSolidity", "ShapeOrientationDeg",
@@ -543,6 +501,9 @@ X_test = X_test.replace([np.inf, -np.inf], np.nan)
 X_train.to_csv(OUT_DIR / "X_train.csv", index=False)
 y_train.to_csv(OUT_DIR / "y_train.csv", index=False)
 X_test.to_csv(OUT_DIR / "X_test.csv", index=False)
+metadata_train.to_csv(OUT_DIR / "metadata_train.csv", index=False)
+metadata_test.to_csv(OUT_DIR / "metadata_test.csv", index=False)
+
 
 # ============================================================================
 # 14. SUMMARY
@@ -559,6 +520,10 @@ print("X_test:", X_test.shape)
 print("\nmetadata_train:", metadata_train.shape)
 print("metadata_test:", metadata_test.shape)
 
+print("\nSimCentroid lag columns in X_train:", [
+    c for c in X_train.columns if c.startswith("SimCentroid_") and "_lag_" in c
+])
+
 print("\nFeatures:")
 print(X_train.columns.tolist())
 
@@ -572,4 +537,3 @@ print("\nMissing values in y_train:")
 print(y_train.isna().sum())
 
 print("\nFiles saved in:", OUT_DIR.resolve())
-
